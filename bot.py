@@ -1,12 +1,21 @@
 import os
 import random
 import asyncio
+import uuid
+import time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, InlineQueryHandler
 
 games = {}
+GAME_TIMEOUT = 300  # 5 دقائق
 
-# /start مع الحقوق
+def cleanup_old_games():
+    """تنظيف الألعاب القديمة"""
+    now = time.time()
+    expired = [gid for gid, g in games.items() if now - g.get("created_at", now) > GAME_TIMEOUT]
+    for gid in expired:
+        del games[gid]
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("اتحدى واحد يامرعبهم 😉", switch_inline_query="")]]
     await update.message.reply_text(
@@ -15,18 +24,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-# إنشاء التحدي
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cleanup_old_games()  # تنظيف قبل كل لعبة جديدة
+
     query = update.inline_query
     user = query.from_user
-    chat_type = getattr(query, "chat_type", "private")  # private, group, supergroup, channel
+    chat_type = getattr(query, "chat_type", "private")
 
-    # إنشاء game_id فريد لكل تحدي
-    game_id = f"{user.id}_{random.randint(1000,9999)}"
-    games[game_id] = {"player1": user.id, "player2": None, "choices": {}}
+    # ✅ game_id فريد 100% في كل مرة
+    game_id = str(uuid.uuid4()).replace("-", "")[:16]
+    games[game_id] = {
+        "player1": user.id,
+        "player2": None,
+        "choices": {},
+        "created_at": time.time()
+    }
+
     p1_name = f"@{user.username}" if user.username else user.first_name
 
-    # النص حسب الشخص أو المجموعة/القناة
     if chat_type == "private":
         text = f"{p1_name} يتحداك تقدر تسحلة بالطابوكة ورقة مقص؟"
     else:
@@ -37,16 +52,14 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title="طابوكة ورقة مقص",
         input_message_content=InputTextMessageContent(text),
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("تعال اخسرك يابوت 😜", callback_data=f"join_{game_id}")]
+            [InlineKeyboardButton("تعال اخسرك يابوت 😜", callback_data=f"join|{game_id}")]
         ])
     )
-    await query.answer([result])
+    await query.answer([result], cache_time=0)  # ✅ cache_time=0 مهم جداً
 
-# دخول اللاعب الثاني
 async def join_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    game_id = query.data.split("_", 1)[1]  # split فقط على أول "_"
+    game_id = query.data.split("|")[1]
     user = query.from_user
 
     if game_id not in games:
@@ -59,16 +72,16 @@ async def join_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("ما تكدر تلعب ويا نفسك 😂", show_alert=True)
         return
 
-    if game["player2"] is None:
-        game["player2"] = user.id
-    else:
+    if game["player2"] is not None:
         await query.answer("شعدك داخل مجاي تشوفهم يلعبون", show_alert=True)
         return
 
+    game["player2"] = user.id
+
     keyboard = [[
-        InlineKeyboardButton("🪨 طابوكة", callback_data=f"pick_{game_id}_حجرة"),
-        InlineKeyboardButton("📄 ورقة", callback_data=f"pick_{game_id}_ورقة"),
-        InlineKeyboardButton("✂️ مقص", callback_data=f"pick_{game_id}_مقص")
+        InlineKeyboardButton("🪨 طابوكة", callback_data=f"pick|{game_id}|حجرة"),
+        InlineKeyboardButton("📄 ورقة", callback_data=f"pick|{game_id}|ورقة"),
+        InlineKeyboardButton("✂️ مقص", callback_data=f"pick|{game_id}|مقص")
     ]]
 
     await query.edit_message_text(
@@ -76,29 +89,34 @@ async def join_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-# الاختيار والنتيجة
 async def pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    _, game_id, choice = query.data.split("_", 2)
+    parts = query.data.split("|")
+    game_id = parts[1]
+    choice = parts[2]
     user = query.from_user
     game = games.get(game_id)
+
     if not game:
         await query.answer("اللعبة انتهت بالفعل!", show_alert=True)
         return
 
     if user.id not in [game["player1"], game["player2"]]:
-        await query.answer("انتي او انت مو لاعب او لاعبة ", show_alert=True)
+        await query.answer("انتي او انت مو لاعب او لاعبة", show_alert=True)
+        return
+
+    if user.id in game["choices"]:
+        await query.answer("اختريت بالفعل، انتظر الثاني ⏳", show_alert=True)
         return
 
     game["choices"][user.id] = choice
 
     if len(game["choices"]) < 2:
-        await query.answer("تم طلع اسمك بالرعاية انتظر الثاني")
+        await query.answer("✅ تم اختيارك! انتظر الثاني...")
         return
 
-    # الحصول على اللاعبين
     p1_id = game["player1"]
     p2_id = game["player2"]
     c1 = game["choices"][p1_id]
@@ -109,19 +127,18 @@ async def pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     p1_name = f"@{p1_chat.username}" if p1_chat.username else p1_chat.first_name
     p2_name = f"@{p2_chat.username}" if p2_chat.username else p2_chat.first_name
 
-    # العد التنازلي قبل النتيجة
     for i in range(3, 0, -1):
+        await query.edit_message_text(f"⏳ بعد شوي للنتيجة: {i} ...")
         await asyncio.sleep(1)
-        await query.edit_message_text(f"بعد شوي للنتيجة: {i} ...")
-    await asyncio.sleep(1)
 
-    # تحديد الفائز برسائل ممتعة
     if c1 == c2:
-        result = "🤝 تعادل لا خاسر ولا فايز "
-    elif (c1 == "حجرة" and c2 == "مقص") or (c1 == "ورقة" and c2 == "حجرة") or (c1 == "مقص" and c2 == "ورقة"):
-        result = f"{p1_name} فلش الخصم وفاز 🔥"
+        result = "🤝 تعادل لا خاسر ولا فايز"
+    elif (c1 == "حجرة" and c2 == "مقص") or \
+         (c1 == "ورقة" and c2 == "حجرة") or \
+         (c1 == "مقص" and c2 == "ورقة"):
+        result = f"🔥 {p1_name} فلش الخصم وفاز!"
     else:
-        result = f" {p2_name} فلش الخصم وفاز 🔥"
+        result = f"🔥 {p2_name} فلش الخصم وفاز!"
 
     await query.edit_message_text(
         f"🧑‍🦱 {p1_name}: {c1}\n"
@@ -130,7 +147,6 @@ async def pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     del games[game_id]
 
-# تشغيل البوت باستخدام متغير البيئة
 TOKEN = os.environ.get("TOKEN")
 if not TOKEN:
     raise ValueError("يجب وضع متغير البيئة TOKEN لتوكن البوت")
@@ -138,6 +154,7 @@ if not TOKEN:
 app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(InlineQueryHandler(inline_query))
-app.add_handler(CallbackQueryHandler(join_game, pattern="join_"))
-app.add_handler(CallbackQueryHandler(pick, pattern="pick_"))
+# ✅ patterns واضحة ومحددة
+app.add_handler(CallbackQueryHandler(join_game, pattern=r"^join\|"))
+app.add_handler(CallbackQueryHandler(pick, pattern=r"^pick\|"))
 app.run_polling()
